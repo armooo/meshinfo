@@ -4,9 +4,11 @@ import asyncio
 import datetime
 import json
 import os
+import time
+import traceback
 from zoneinfo import ZoneInfo
 
-import paho.mqtt.client as mqtt_client
+import aiomqtt
 from dotenv import load_dotenv
 from jinja2 import Environment, FileSystemLoader
 
@@ -33,34 +35,8 @@ traceroutes = []
 traceroutes_by_node = {}
 
 
-def connect_mqtt(broker, port, client_id, username, password):
-    def on_connect(client, userdata, flags, rc, properties=None):
-        global mqtt_connect_time
-        if rc == 0:
-            mqtt_connect_time = datetime.datetime.now(
-                ZoneInfo(config["server"]["timezone"])
-            )
-            print("Connected to MQTT broker at %s:%d" % (broker, port))
-        else:
-            print("Failed to connect, error: %s\n" % rc)
-
-    def on_disconnect(client, userdata, flags, rc, properties=None):
-        print("Disconnected from MQTT broker: %s" % rc)
-        print("Reconnecting...")
-
-    client = mqtt_client.Client(
-        client_id=client_id,
-        callback_api_version=mqtt_client.CallbackAPIVersion.VERSION2,
-    )
-    client.on_connect = on_connect
-    client.on_disconnect = on_disconnect
-    client.username_pw_set(username, password)
-    client.connect(broker, port)
-    return client
-
-
-def publish(client, topic, msg):
-    result = client.publish(topic, msg)
+async def publish(client, topic, msg):
+    result = await client.publish(topic, msg)
 
     status = result[0]
 
@@ -73,30 +49,25 @@ def publish(client, topic, msg):
         return False
 
 
-def subscribe(client, topic):
-    def on_message(client, userdata, msg, properties=None):
-        try:
-            j = json.loads(msg.payload.decode(), cls=_JSONDecoder)
-            handle_log(msg)
-            if j["type"] == "neighborinfo":
-                handle_neighborinfo(client, userdata, j)
-            if j["type"] == "nodeinfo":
-                handle_nodeinfo(client, userdata, j)
-            if j["type"] == "position":
-                handle_position(client, userdata, j)
-            if j["type"] == "telemetry":
-                handle_telemetry(client, userdata, j)
-            if j["type"] == "text":
-                handle_text(client, userdata, j)
-            if j["type"] == "traceroute":
-                handle_traceroute(client, userdata, j)
-            prune_expired_nodes()
-        except Exception as e:
-            print(e)
-
-    client.subscribe(topic)
-    client.on_message = on_message
-
+def process_mqtt_msg(client, msg):
+    try:
+        j = json.loads(msg.payload.decode(), cls=_JSONDecoder)
+        handle_log(msg)
+        if j["type"] == "neighborinfo":
+            handle_neighborinfo(client, j)
+        if j["type"] == "nodeinfo":
+            handle_nodeinfo(client, j)
+        if j["type"] == "position":
+            handle_position(client, j)
+        if j["type"] == "telemetry":
+            handle_telemetry(client, j)
+        if j["type"] == "text":
+            handle_text(client, j)
+        if j["type"] == "traceroute":
+            handle_traceroute(client, j)
+        prune_expired_nodes()
+    except Exception as e:
+        traceback.print_exc()
 
 def update_node(id, node):
     node["active"] = True
@@ -141,7 +112,7 @@ def handle_log(msg):
         f.write(f"{msg.payload.decode()}\n")
 
 
-def handle_neighborinfo(client, userdata, msg):
+def handle_neighborinfo(client, msg):
     global nodes
 
     id = "!" + f'{msg["from"]:x}'
@@ -158,7 +129,7 @@ def handle_neighborinfo(client, userdata, msg):
     save()
 
 
-def handle_nodeinfo(client, userdata, msg):
+def handle_nodeinfo(client, msg):
     global nodes
     id = msg["payload"]["id"]
     if id in nodes:
@@ -179,7 +150,7 @@ def handle_nodeinfo(client, userdata, msg):
     save()
 
 
-def handle_position(client, userdata, msg):
+def handle_position(client, msg):
     # convert msg['from'] to hex
     id = "!" + f'{msg["from"]:x}'
     if id in nodes:
@@ -195,7 +166,7 @@ def handle_position(client, userdata, msg):
     save()
 
 
-def handle_telemetry(client, userdata, msg):
+def handle_telemetry(client, msg):
     global nodes
     global telemetry
 
@@ -222,7 +193,7 @@ def handle_telemetry(client, userdata, msg):
     save()
 
 
-def handle_text(client, userdata, msg):
+def handle_text(client, msg):
     global chat
 
     chat = {} if chat is None else chat
@@ -247,7 +218,7 @@ def handle_text(client, userdata, msg):
     save()
 
 
-def handle_traceroute(client, userdata, msg):
+def handle_traceroute(client, msg):
     global traceroutes
     global traceroutes_by_node
 
@@ -772,15 +743,33 @@ async def start_mqtt_processor():
     if os.environ.get("MQTT_TOPIC") is not None:
         config["broker"]["topic"] = os.environ["MQTT_TOPIC"]
 
-    client = connect_mqtt(
-        config["broker"]["host"],
-        config["broker"]["port"],
-        config["broker"]["client_id"],
-        config["broker"]["username"],
-        config["broker"]["password"],
-    )
-    subscribe(client, config["broker"]["topic"])
-    client.loop_forever()
+    while True:
+        try:
+            async with aiomqtt.Client(
+                hostname=config["broker"]["host"],
+                port=config["broker"]["port"],
+                identifier=config["broker"]["client_id"],
+                username=config["broker"]["username"],
+                password=config["broker"]["password"],
+            ) as client:
+                mqtt_connect_time = datetime.datetime.now(
+                    ZoneInfo(config["server"]["timezone"])
+                )
+                print("Connected to MQTT broker at %s:%d" % (
+                    config["broker"]["host"],
+                    config["broker"]["port"],
+                ))
+                await client.subscribe(config["broker"]["topic"])
+                async for msg in client.messages:
+                    # paho adds a timestamp to messages which is not in
+                    # aiomqtt. We will do that ourself here so it is compatible.
+                    msg.timestamp = time.monotonic()
+                    process_mqtt_msg(client, msg)
+        except aiomqtt.MqttError as err:
+            print("Disconnected from MQTT broker: %s", err)
+            print("Reconnecting...")
+            await asyncio.sleep(5)
+
     print("MQTT Processor Done!")
 
 
